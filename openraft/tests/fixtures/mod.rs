@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::env;
+use std::marker::PhantomData;
+use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -52,7 +54,6 @@ use openraft::LeaderId;
 use openraft::LogId;
 use openraft::LogIdOptionExt;
 use openraft::Node;
-use openraft::NodeId;
 use openraft::Raft;
 use openraft::RaftMetrics;
 use openraft::RaftNetwork;
@@ -97,10 +98,11 @@ macro_rules! init_ut {
     }};
 }
 
-pub type StoreWithDefensive = StoreExt<MemConfig, Arc<MemStore>>;
+pub type StoreWithDefensive<C = MemConfig, S: RaftStorage<C> = Arc<MemStore>> = StoreExt<C, S>;
 
 /// A concrete Raft type used during testing.
-pub type MemRaft = Raft<MemConfig, RaftRouter, StoreWithDefensive>;
+pub type MemRaft<C = MemConfig, S: RaftStorage<C> = Arc<MemStore>> =
+    Raft<C, TypedRaftRouter<C, S>, StoreWithDefensive<C, S>>;
 
 pub fn init_default_ut_tracing() {
     static START: Once = Once::new();
@@ -124,32 +126,36 @@ pub fn init_global_tracing(app_name: &str, dir: &str, level: &str) -> WorkerGuar
 }
 
 /// A type which emulates a network transport and implements the `RaftNetworkFactory` trait.
-pub struct RaftRouter {
+pub struct TypedRaftRouter<C: RaftTypeConfig = memstore::Config, S: RaftStorage<C> = Arc<MemStore>> {
     /// The Raft runtime config which all nodes are using.
     config: Arc<Config>,
     /// The table of all nodes currently known to this router instance.
-    routing_table: Arc<Mutex<BTreeMap<NodeId, (MemRaft, StoreWithDefensive)>>>,
+    routing_table: Arc<Mutex<BTreeMap<C::NodeId, (MemRaft<C, S>, StoreWithDefensive<C, S>)>>>,
     /// Nodes which are isolated can neither send nor receive frames.
-    isolated_nodes: Arc<Mutex<HashSet<NodeId>>>,
+    isolated_nodes: Arc<Mutex<HashSet<C::NodeId>>>,
 
     /// To emulate network delay for sending, in milliseconds.
     /// 0 means no delay.
     send_delay: Arc<AtomicU64>,
 }
 
-pub struct Builder {
+/// Default `RaftRouter` for memstore.
+pub type RaftRouter = TypedRaftRouter<memstore::Config, Arc<MemStore>>;
+
+pub struct Builder<C: RaftTypeConfig, S: RaftStorage<C>> {
     config: Arc<Config>,
     send_delay: u64,
+    _phantom: PhantomData<(C, S)>,
 }
 
-impl Builder {
+impl<C: RaftTypeConfig, S: RaftStorage<C>> Builder<C, S> {
     pub fn send_delay(mut self, ms: u64) -> Self {
         self.send_delay = ms;
         self
     }
 
-    pub fn build(self) -> RaftRouter {
-        RaftRouter {
+    pub fn build(self) -> TypedRaftRouter<C, S> {
+        TypedRaftRouter {
             config: self.config,
             routing_table: Default::default(),
             isolated_nodes: Default::default(),
@@ -158,7 +164,7 @@ impl Builder {
     }
 }
 
-impl Clone for RaftRouter {
+impl<C: RaftTypeConfig, S: RaftStorage<C>> Clone for TypedRaftRouter<C, S> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -169,9 +175,13 @@ impl Clone for RaftRouter {
     }
 }
 
-impl RaftRouter {
-    pub fn builder(config: Arc<Config>) -> Builder {
-        Builder { config, send_delay: 0 }
+impl<C: RaftTypeConfig, S: RaftStorage<C>> TypedRaftRouter<C, S> {
+    pub fn builder(config: Arc<Config>) -> Builder<C, S> {
+        Builder {
+            config,
+            send_delay: 0,
+            _phantom: PhantomData,
+        }
     }
 
     /// Create a new instance.
@@ -200,8 +210,8 @@ impl RaftRouter {
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn new_nodes_from_single(
         &mut self,
-        node_ids: BTreeSet<NodeId>,
-        learners: BTreeSet<NodeId>,
+        node_ids: BTreeSet<C::NodeId>,
+        learners: BTreeSet<C::NodeId>,
     ) -> anyhow::Result<u64> {
         assert!(node_ids.contains(&0));
 
@@ -223,7 +233,7 @@ impl RaftRouter {
         self.assert_stable_cluster(Some(1), Some(log_index)).await;
 
         for id in node_ids.iter() {
-            if *id == 0 {
+            if *id == 0.into() {
                 continue;
             }
             tracing::info!("--- add voter: {}", id);
@@ -274,12 +284,12 @@ impl RaftRouter {
     }
 
     /// Create and register a new Raft node bearing the given ID.
-    pub async fn new_raft_node(&mut self, id: NodeId) {
+    pub async fn new_raft_node(&mut self, id: C::NodeId) {
         let memstore = self.new_store().await;
         self.new_raft_node_with_sto(id, memstore).await
     }
 
-    pub async fn new_store(&mut self) -> StoreWithDefensive {
+    pub async fn new_store(&mut self) -> StoreWithDefensive<C, S> {
         let defensive = env::var("RAFT_STORE_DEFENSIVE").ok();
 
         let sto = StoreExt::new(Arc::new(MemStore::new().await));
@@ -306,14 +316,14 @@ impl RaftRouter {
     }
 
     #[tracing::instrument(level = "debug", skip(self, sto))]
-    pub async fn new_raft_node_with_sto(&mut self, id: NodeId, sto: StoreWithDefensive) {
+    pub async fn new_raft_node_with_sto(&mut self, id: C::NodeId, sto: StoreWithDefensive<C, S>) {
         let node = Raft::new(id, self.config.clone(), self.clone(), sto.clone());
         let mut rt = self.routing_table.lock().unwrap();
         rt.insert(id, (node, sto));
     }
 
     /// Remove the target node from the routing table & isolation.
-    pub async fn remove_node(&mut self, id: NodeId) -> Option<(MemRaft, StoreWithDefensive)> {
+    pub async fn remove_node(&mut self, id: C::NodeId) -> Option<(MemRaft, StoreWithDefensive)> {
         let opt_handles = {
             let mut rt = self.routing_table.lock().unwrap();
             rt.remove(&id)
@@ -328,9 +338,9 @@ impl RaftRouter {
     }
 
     /// Initialize all nodes based on the config in the routing table.
-    pub async fn initialize_from_single_node(&self, node_id: NodeId) -> Result<()> {
+    pub async fn initialize_from_single_node(&self, node_id: C::NodeId) -> Result<()> {
         tracing::info!({ node_id }, "initializing cluster from single node");
-        let members: BTreeSet<NodeId> = {
+        let members: BTreeSet<C::NodeId> = {
             let rt = self.routing_table.lock().unwrap();
             rt.keys().cloned().collect()
         };
@@ -341,7 +351,7 @@ impl RaftRouter {
     }
 
     /// Initialize cluster with specified node ids.
-    pub async fn initialize_with(&self, node_id: NodeId, members: BTreeSet<NodeId>) -> Result<()> {
+    pub async fn initialize_with(&self, node_id: C::NodeId, members: BTreeSet<C::NodeId>) -> Result<()> {
         tracing::info!({ node_id }, "initializing cluster from single node");
         let n = self.get_raft_handle(&node_id)?;
         n.initialize(members.clone()).await?;
@@ -350,12 +360,12 @@ impl RaftRouter {
 
     /// Isolate the network of the specified node.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn isolate_node(&self, id: NodeId) {
+    pub async fn isolate_node(&self, id: C::NodeId) {
         self.isolated_nodes.lock().unwrap().insert(id);
     }
 
     /// Get a payload of the latest metrics from each node in the cluster.
-    pub fn latest_metrics(&self) -> Vec<RaftMetrics> {
+    pub fn latest_metrics(&self) -> Vec<RaftMetrics<C>> {
         let rt = self.routing_table.lock().unwrap();
         let mut metrics = vec![];
         for node in rt.values() {
@@ -364,14 +374,14 @@ impl RaftRouter {
         metrics
     }
 
-    pub fn get_metrics(&self, node_id: &NodeId) -> Result<RaftMetrics> {
+    pub fn get_metrics(&self, node_id: &C::NodeId) -> Result<RaftMetrics<C>> {
         let node = self.get_raft_handle(node_id)?;
         let metrics = node.metrics().borrow().clone();
         Ok(metrics)
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    pub fn get_raft_handle(&self, node_id: &NodeId) -> std::result::Result<MemRaft, NodeNotFound> {
+    pub fn get_raft_handle(&self, node_id: &C::NodeId) -> std::result::Result<MemRaft<C, S>, NodeNotFound<C>> {
         let rt = self.routing_table.lock().unwrap();
         let raft_and_sto = rt.get(node_id).ok_or_else(|| NodeNotFound {
             node_id: *node_id,
@@ -381,7 +391,7 @@ impl RaftRouter {
         Ok(r)
     }
 
-    pub fn get_storage_handle(&self, node_id: &NodeId) -> Result<StoreWithDefensive> {
+    pub fn get_storage_handle(&self, node_id: &C::NodeId) -> Result<StoreWithDefensive<C, S>> {
         let rt = self.routing_table.lock().unwrap();
         let addr = rt.get(node_id).with_context(|| format!("could not find node {} in routing table", node_id))?;
         let sto = addr.clone().1;
@@ -392,23 +402,23 @@ impl RaftRouter {
     #[tracing::instrument(level = "info", skip(self, func))]
     pub async fn wait_for_metrics<T>(
         &self,
-        node_id: &NodeId,
+        node_id: &C::NodeId,
         func: T,
         timeout: Option<Duration>,
         msg: &str,
-    ) -> Result<RaftMetrics>
+    ) -> Result<RaftMetrics<C>>
     where
-        T: Fn(&RaftMetrics) -> bool + Send,
+        T: Fn(&RaftMetrics<C>) -> bool + Send,
     {
         let wait = self.wait(node_id, timeout).await?;
         let rst = wait.metrics(func, format!("node-{} {}", node_id, msg)).await?;
         Ok(rst)
     }
 
-    pub async fn wait(&self, node_id: &NodeId, timeout: Option<Duration>) -> Result<Wait> {
+    pub async fn wait(&self, node_id: &C::NodeId, timeout: Option<Duration>) -> Result<Wait<C>> {
         let node = {
             let rt = self.routing_table.lock().unwrap();
-            rt.get(node_id).expect("target node not found in routing table").clone().0
+            rt.get(node_id).expect("target node not found in routing table").clone().0.clone()
         };
 
         Ok(node.wait(timeout))
@@ -418,7 +428,7 @@ impl RaftRouter {
     #[tracing::instrument(level = "info", skip(self))]
     pub async fn wait_for_log(
         &self,
-        node_ids: &BTreeSet<u64>,
+        node_ids: &BTreeSet<C::NodeId>,
         want_log: Option<u64>,
         timeout: Option<Duration>,
         msg: &str,
@@ -432,8 +442,8 @@ impl RaftRouter {
     #[tracing::instrument(level = "info", skip(self))]
     pub async fn wait_for_members(
         &self,
-        node_ids: &BTreeSet<u64>,
-        members: BTreeSet<u64>,
+        node_ids: &BTreeSet<C::NodeId>,
+        members: BTreeSet<C::NodeId>,
         timeout: Option<Duration>,
         msg: &str,
     ) -> Result<()> {
@@ -455,7 +465,7 @@ impl RaftRouter {
     #[tracing::instrument(level = "info", skip(self))]
     pub async fn wait_for_state(
         &self,
-        node_ids: &BTreeSet<u64>,
+        node_ids: &BTreeSet<C::NodeId>,
         want_state: State,
         timeout: Option<Duration>,
         msg: &str,
@@ -470,8 +480,8 @@ impl RaftRouter {
     #[tracing::instrument(level = "info", skip(self))]
     pub async fn wait_for_snapshot(
         &self,
-        node_ids: &BTreeSet<u64>,
-        want: LogId,
+        node_ids: &BTreeSet<C::NodeId>,
+        want: LogId<C>,
         timeout: Option<Duration>,
         msg: &str,
     ) -> Result<()> {
@@ -482,7 +492,7 @@ impl RaftRouter {
     }
 
     /// Get the ID of the current leader.
-    pub fn leader(&self) -> Option<NodeId> {
+    pub fn leader(&self) -> Option<C::NodeId> {
         let isolated = {
             let isolated = self.isolated_nodes.lock().unwrap();
             isolated.clone()
@@ -503,22 +513,26 @@ impl RaftRouter {
 
     /// Restore the network of the specified node.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn restore_node(&self, id: NodeId) {
+    pub async fn restore_node(&self, id: C::NodeId) {
         let mut nodes = self.isolated_nodes.lock().unwrap();
         nodes.remove(&id);
     }
 
-    pub async fn add_learner(&self, leader: NodeId, target: NodeId) -> Result<AddLearnerResponse, AddLearnerError> {
+    pub async fn add_learner(
+        &self,
+        leader: C::NodeId,
+        target: C::NodeId,
+    ) -> Result<AddLearnerResponse<C>, AddLearnerError<C>> {
         let node = self.get_raft_handle(&leader).unwrap();
         node.add_learner(target, None, true).await
     }
 
     pub async fn add_learner_with_blocking(
         &self,
-        leader: NodeId,
-        target: NodeId,
+        leader: C::NodeId,
+        target: C::NodeId,
         blocking: bool,
-    ) -> Result<AddLearnerResponse, AddLearnerError> {
+    ) -> Result<AddLearnerResponse<C>, AddLearnerError<C>> {
         let node = {
             let rt = self.routing_table.lock().unwrap();
             rt.get(&leader).unwrap_or_else(|| panic!("node with ID {} does not exist", leader)).clone()
@@ -527,7 +541,7 @@ impl RaftRouter {
     }
 
     /// Send a client read request to the target node.
-    pub async fn client_read(&self, target: NodeId) -> Result<(), ClientReadError> {
+    pub async fn client_read(&self, target: C::NodeId) -> Result<(), ClientReadError<C>> {
         let node = {
             let rt = self.routing_table.lock().unwrap();
             rt.get(&target).unwrap_or_else(|| panic!("node with ID {} does not exist", target)).clone()
@@ -536,7 +550,7 @@ impl RaftRouter {
     }
 
     /// Send a client request to the target node, causing test failure on error.
-    pub async fn client_request(&self, target: NodeId, client_id: &str, serial: u64) {
+    pub async fn client_request(&self, target: C::NodeId, client_id: &str, serial: u64) {
         let req = MemClientRequest {
             client: client_id.into(),
             serial,
@@ -549,13 +563,13 @@ impl RaftRouter {
     }
 
     /// Request the current leader from the target node.
-    pub async fn current_leader(&self, target: NodeId) -> Option<NodeId> {
+    pub async fn current_leader(&self, target: C::NodeId) -> Option<C::NodeId> {
         let node = self.get_raft_handle(&target).unwrap();
         node.current_leader().await
     }
 
     /// Send multiple client requests to the target node, causing test failure on error.
-    pub async fn client_request_many(&self, target: NodeId, client_id: &str, count: usize) {
+    pub async fn client_request_many(&self, target: C::NodeId, client_id: &str, count: usize) {
         for idx in 0..count {
             self.client_request(target, client_id, idx as u64).await
         }
@@ -563,9 +577,9 @@ impl RaftRouter {
 
     async fn send_client_request(
         &self,
-        target: NodeId,
+        target: C::NodeId,
         req: MemClientRequest,
-    ) -> std::result::Result<MemClientResponse, ClientWriteError> {
+    ) -> std::result::Result<MemClientResponse, ClientWriteError<C>> {
         let node = {
             let rt = self.routing_table.lock().unwrap();
             rt.get(&target)
@@ -573,7 +587,7 @@ impl RaftRouter {
                 .clone()
         };
 
-        let payload = EntryPayload::Normal(req);
+        let payload = EntryPayload::<C>::Normal(req);
 
         node.0.client_write(ClientWriteRequest::new(payload)).await.map(|res| res.data)
     }
@@ -723,7 +737,7 @@ impl RaftRouter {
         expect_term: u64,
         expect_last_log: u64,
         expect_voted_for: Option<u64>,
-        expect_sm_last_applied_log: LogId,
+        expect_sm_last_applied_log: LogId<C>,
         expect_snapshot: &Option<(ValueTest<u64>, u64)>,
     ) -> anyhow::Result<()> {
         let last_log_id = storage.get_log_state().await?.last_log_id;
@@ -800,11 +814,11 @@ impl RaftRouter {
     /// Assert against the state of the storage system one node in the cluster.
     pub async fn assert_storage_state_in_node(
         &self,
-        node_id: u64,
+        node_id: C::NodeId,
         expect_term: u64,
         expect_last_log: u64,
-        expect_voted_for: Option<u64>,
-        expect_sm_last_applied_log: LogId,
+        expect_voted_for: Option<C::NodeId>,
+        expect_sm_last_applied_log: LogId<C>,
         expect_snapshot: Option<(ValueTest<u64>, u64)>,
     ) -> anyhow::Result<()> {
         let mut rt = self.routing_table.lock().unwrap();
@@ -836,7 +850,7 @@ impl RaftRouter {
         expect_term: u64,
         expect_last_log: u64,
         expect_voted_for: Option<u64>,
-        expect_sm_last_applied_log: LogId,
+        expect_sm_last_applied_log: LogId<C>,
         expect_snapshot: Option<(ValueTest<u64>, u64)>,
     ) -> anyhow::Result<()> {
         let mut rt = self.routing_table.lock().unwrap();
@@ -858,7 +872,7 @@ impl RaftRouter {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    pub fn check_reachable(&self, id: NodeId, target: NodeId) -> std::result::Result<(), NetworkError> {
+    pub fn check_reachable(&self, id: C::NodeId, target: C::NodeId) -> std::result::Result<(), NetworkError> {
         let isolated = self.isolated_nodes.lock().unwrap();
 
         if isolated.contains(&target) || isolated.contains(&id) {
@@ -871,10 +885,10 @@ impl RaftRouter {
 }
 
 #[async_trait]
-impl RaftNetworkFactory<MemConfig> for RaftRouter {
-    type Network = RaftRouterNetwork;
+impl<C: RaftTypeConfig, S: RaftStorage<C>> RaftNetworkFactory<C> for TypedRaftRouter<C, S> {
+    type Network = RaftRouterNetwork<C, S>;
 
-    async fn connect(&mut self, target: NodeId, _node: Option<&Node>) -> Self::Network {
+    async fn connect(&mut self, target: C::NodeId, _node: Option<&Node>) -> Self::Network {
         RaftRouterNetwork {
             target,
             owner: self.clone(),
@@ -882,18 +896,18 @@ impl RaftNetworkFactory<MemConfig> for RaftRouter {
     }
 }
 
-pub struct RaftRouterNetwork {
-    target: NodeId,
-    owner: RaftRouter,
+pub struct RaftRouterNetwork<C: RaftTypeConfig, S: RaftStorage<C>> {
+    target: C::NodeId,
+    owner: TypedRaftRouter<C, S>,
 }
 
 #[async_trait]
-impl RaftNetwork<MemConfig> for RaftRouterNetwork {
+impl<C: RaftTypeConfig, S: RaftStorage<C>> RaftNetwork<C> for RaftRouterNetwork<C, S> {
     /// Send an AppendEntries RPC to the target Raft node (§5).
     async fn send_append_entries(
         &mut self,
-        rpc: AppendEntriesRequest<MemConfig>,
-    ) -> std::result::Result<AppendEntriesResponse, RPCError<AppendEntriesError>> {
+        rpc: AppendEntriesRequest<C>,
+    ) -> std::result::Result<AppendEntriesResponse<C>, RPCError<C, AppendEntriesError<C>>> {
         tracing::debug!("append_entries to id={} {:?}", self.target, rpc);
         self.owner.rand_send_delay().await;
 
@@ -911,8 +925,8 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
     /// Send an InstallSnapshot RPC to the target Raft node (§7).
     async fn send_install_snapshot(
         &mut self,
-        rpc: InstallSnapshotRequest,
-    ) -> std::result::Result<InstallSnapshotResponse, RPCError<InstallSnapshotError>> {
+        rpc: InstallSnapshotRequest<C>,
+    ) -> std::result::Result<InstallSnapshotResponse<C>, RPCError<C, InstallSnapshotError<C>>> {
         self.owner.rand_send_delay().await;
 
         self.owner.check_reachable(rpc.vote.node_id, self.target)?;
@@ -925,7 +939,10 @@ impl RaftNetwork<MemConfig> for RaftRouterNetwork {
     }
 
     /// Send a RequestVote RPC to the target Raft node (§5).
-    async fn send_vote(&mut self, rpc: VoteRequest) -> std::result::Result<VoteResponse, RPCError<VoteError>> {
+    async fn send_vote(
+        &mut self,
+        rpc: VoteRequest<C>,
+    ) -> std::result::Result<VoteResponse<C>, RPCError<C, VoteError<C>>> {
         self.owner.rand_send_delay().await;
 
         self.owner.check_reachable(rpc.vote.node_id, self.target)?;
@@ -962,7 +979,7 @@ fn timeout() -> Option<Duration> {
 /// Create a blank log entry for test.
 pub fn blank<C: RaftTypeConfig>(term: u64, index: u64) -> Entry<C> {
     Entry {
-        log_id: LogId::new(LeaderId::new(term, 0), index),
+        log_id: LogId::new(LeaderId::new(term, 0.into()), index),
         payload: EntryPayload::Blank,
     }
 }

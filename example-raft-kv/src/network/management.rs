@@ -8,7 +8,6 @@ use actix_web::web::Data;
 use actix_web::Responder;
 use openraft::error::Infallible;
 use openraft::Node;
-use openraft::NodeId;
 use openraft::RaftMetrics;
 use web::Json;
 
@@ -22,7 +21,7 @@ use crate::app::ExampleApp;
 /// This should be done before adding a node as a member into the cluster
 /// (by calling `change-membership`)
 #[post("/add-learner")]
-pub async fn add_learner(app: Data<ExampleApp>, req: Json<(NodeId, String)>) -> actix_web::Result<impl Responder> {
+pub async fn add_learner(app: Data<ExampleApp>, req: Json<(C::NodeId, String)>) -> actix_web::Result<impl Responder> {
     let node_id = req.0 .0;
     let node = Node {
         addr: req.0 .1.clone(),
@@ -36,7 +35,7 @@ pub async fn add_learner(app: Data<ExampleApp>, req: Json<(NodeId, String)>) -> 
 #[post("/change-membership")]
 pub async fn change_membership(
     app: Data<ExampleApp>,
-    req: Json<BTreeSet<NodeId>>,
+    req: Json<BTreeSet<C::NodeId>>,
 ) -> actix_web::Result<impl Responder> {
     let res = app.raft.change_membership(req.0, true, false).await;
     Ok(Json(res))

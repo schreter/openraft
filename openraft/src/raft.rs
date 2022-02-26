@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Debug;
+use std::fmt::Display;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,21 +36,41 @@ use crate::LogId;
 use crate::Membership;
 use crate::MessageSummary;
 use crate::Node;
-use crate::NodeId;
 use crate::RaftNetworkFactory;
 use crate::RaftStorage;
 use crate::SnapshotMeta;
 use crate::Vote;
 
-pub trait RaftTypeConfig: Sized + Send + Sync + 'static {
+pub trait RaftTypeConfig:
+    Sized + Send + Sync + Debug + Clone + Copy + Default + Eq + PartialEq + Ord + PartialOrd + serde::Serialize + 'static
+{
     type D: AppData;
     type R: AppDataResponse;
+
+    /// A Raft node's ID.
+    type NodeId: Sized
+        + Send
+        + Sync
+        + Eq
+        + PartialEq
+        + Ord
+        + PartialOrd
+        + Debug
+        + Display
+        + Hash
+        + Copy
+        + Clone
+        + Default
+        + serde::Serialize
+        + for<'a> serde::Deserialize<'a>
+        + From<u64>
+        + 'static;
 }
 
 struct RaftInner<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> {
     tx_api: mpsc::UnboundedSender<(RaftMsg<C>, Span)>,
-    rx_metrics: watch::Receiver<RaftMetrics>,
-    raft_handle: Mutex<Option<JoinHandle<Result<(), Fatal>>>>,
+    rx_metrics: watch::Receiver<RaftMetrics<C>>,
+    raft_handle: Mutex<Option<JoinHandle<Result<(), Fatal<C>>>>>,
     tx_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     marker_n: std::marker::PhantomData<N>,
     marker_s: std::marker::PhantomData<S>,
@@ -99,7 +121,7 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     /// An implementation of the `RaftStorage` trait which will be used by Raft for data storage.
     /// See the docs on the `RaftStorage` trait for more details.
     #[tracing::instrument(level="debug", skip(config, network, storage), fields(cluster=%config.cluster_name))]
-    pub fn new(id: NodeId, config: Arc<Config>, network: N, storage: S) -> Self {
+    pub fn new(id: C::NodeId, config: Arc<Config>, network: N, storage: S) -> Self {
         let (tx_api, rx_api) = mpsc::unbounded_channel();
         let (tx_metrics, rx_metrics) = watch::channel(RaftMetrics::new_initial(id));
         let (tx_shutdown, rx_shutdown) = oneshot::channel();
@@ -125,7 +147,7 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     pub async fn append_entries(
         &self,
         rpc: AppendEntriesRequest<C>,
-    ) -> Result<AppendEntriesResponse, AppendEntriesError> {
+    ) -> Result<AppendEntriesResponse<C>, AppendEntriesError<C>> {
         let (tx, rx) = oneshot::channel();
         self.call_core(RaftMsg::AppendEntries { rpc, tx }, rx).await
     }
@@ -134,7 +156,7 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     ///
     /// These RPCs are sent by cluster peers which are in candidate state attempting to gather votes (§5.2).
     #[tracing::instrument(level = "debug", skip(self, rpc), fields(rpc=%rpc.summary()))]
-    pub async fn vote(&self, rpc: VoteRequest) -> Result<VoteResponse, VoteError> {
+    pub async fn vote(&self, rpc: VoteRequest<C>) -> Result<VoteResponse<C>, VoteError<C>> {
         let (tx, rx) = oneshot::channel();
         self.call_core(RaftMsg::RequestVote { rpc, tx }, rx).await
     }
@@ -146,8 +168,8 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     #[tracing::instrument(level = "debug", skip(self, rpc), fields(snapshot_id=%rpc.meta.last_log_id))]
     pub async fn install_snapshot(
         &self,
-        rpc: InstallSnapshotRequest,
-    ) -> Result<InstallSnapshotResponse, InstallSnapshotError> {
+        rpc: InstallSnapshotRequest<C>,
+    ) -> Result<InstallSnapshotResponse<C>, InstallSnapshotError<C>> {
         let (tx, rx) = oneshot::channel();
         self.call_core(RaftMsg::InstallSnapshot { rpc, tx }, rx).await
     }
@@ -158,7 +180,7 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     /// up-to-date; however, the `client_read` method must still be used to guard against stale
     /// reads. This method is perfect for making decisions on where to route client requests.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn current_leader(&self) -> Option<NodeId> {
+    pub async fn current_leader(&self) -> Option<C::NodeId> {
         self.metrics().borrow().current_leader
     }
 
@@ -167,7 +189,7 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     /// The actual read operation itself is up to the application, this method just ensures that
     /// the read will not be stale.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn client_read(&self) -> Result<(), ClientReadError> {
+    pub async fn client_read(&self) -> Result<(), ClientReadError<C>> {
         let (tx, rx) = oneshot::channel();
         self.call_core(RaftMsg::ClientReadRequest { tx }, rx).await
     }
@@ -190,7 +212,10 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     /// These are application specific requirements, and must be implemented by the application which is
     /// being built on top of Raft.
     #[tracing::instrument(level = "debug", skip(self, rpc))]
-    pub async fn client_write(&self, rpc: ClientWriteRequest<C>) -> Result<ClientWriteResponse<C>, ClientWriteError> {
+    pub async fn client_write(
+        &self,
+        rpc: ClientWriteRequest<C>,
+    ) -> Result<ClientWriteResponse<C>, ClientWriteError<C>> {
         let (tx, rx) = oneshot::channel();
         self.call_core(RaftMsg::ClientWriteRequest { rpc, tx }, rx).await
     }
@@ -224,8 +249,8 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     /// free, and Raft guarantees that the first node to become the cluster leader will propagate
     /// only its own config.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn initialize<T>(&self, members: T) -> Result<(), InitializeError>
-    where T: Into<EitherNodesOrIds> + Debug {
+    pub async fn initialize<T>(&self, members: T) -> Result<(), InitializeError<C>>
+    where T: Into<EitherNodesOrIds<C>> + Debug {
         let (tx, rx) = oneshot::channel();
         self.call_core(
             RaftMsg::Initialize {
@@ -256,10 +281,10 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     #[tracing::instrument(level = "debug", skip(self, id), fields(target=display(id)))]
     pub async fn add_learner(
         &self,
-        id: NodeId,
+        id: C::NodeId,
         node: Option<Node>,
         blocking: bool,
-    ) -> Result<AddLearnerResponse, AddLearnerError> {
+    ) -> Result<AddLearnerResponse<C>, AddLearnerError<C>> {
         let (tx, rx) = oneshot::channel();
         self.call_core(RaftMsg::AddLearner { id, node, blocking, tx }, rx).await
     }
@@ -292,10 +317,10 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn change_membership(
         &self,
-        members: BTreeSet<NodeId>,
+        members: BTreeSet<C::NodeId>,
         blocking: bool,
         turn_to_learner: bool,
-    ) -> Result<ClientWriteResponse<C>, ClientWriteError> {
+    ) -> Result<ClientWriteResponse<C>, ClientWriteError<C>> {
         tracing::info!("change_membership: start to commit joint config");
 
         let (tx, rx) = oneshot::channel();
@@ -346,7 +371,7 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     /// Invoke RaftCore by sending a RaftMsg and blocks waiting for response.
     #[tracing::instrument(level = "debug", skip(self, mes, rx))]
     pub(crate) async fn call_core<T, E>(&self, mes: RaftMsg<C>, rx: RaftRespRx<T, E>) -> Result<T, E>
-    where E: From<Fatal> {
+    where E: From<Fatal<C>> {
         let span = tracing::Span::current();
 
         let sum = if span.is_disabled() { None } else { Some(mes.summary()) };
@@ -390,7 +415,7 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     }
 
     /// Get a handle to the metrics channel.
-    pub fn metrics(&self) -> watch::Receiver<RaftMetrics> {
+    pub fn metrics(&self) -> watch::Receiver<RaftMetrics<C>> {
         self.inner.rx_metrics.clone()
     }
 
@@ -411,7 +436,7 @@ impl<C: RaftTypeConfig, N: RaftNetworkFactory<C>, S: RaftStorage<C>> Raft<C, N, 
     /// // wait for raft state to become a follower
     /// r.wait(None).state(State::Follower, "state").await?;
     /// ```
-    pub fn wait(&self, timeout: Option<Duration>) -> Wait {
+    pub fn wait(&self, timeout: Option<Duration>) -> Wait<C> {
         let timeout = match timeout {
             Some(t) => t,
             None => Duration::from_millis(500),
@@ -446,39 +471,39 @@ pub(crate) type RaftRespTx<T, E> = oneshot::Sender<Result<T, E>>;
 pub(crate) type RaftRespRx<T, E> = oneshot::Receiver<Result<T, E>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddLearnerResponse {
-    pub matched: Option<LogId>,
+pub struct AddLearnerResponse<C: RaftTypeConfig> {
+    pub matched: Option<LogId<C>>,
 }
 
 /// A message coming from the Raft API.
 pub(crate) enum RaftMsg<C: RaftTypeConfig> {
     AppendEntries {
         rpc: AppendEntriesRequest<C>,
-        tx: RaftRespTx<AppendEntriesResponse, AppendEntriesError>,
+        tx: RaftRespTx<AppendEntriesResponse<C>, AppendEntriesError<C>>,
     },
     RequestVote {
-        rpc: VoteRequest,
-        tx: RaftRespTx<VoteResponse, VoteError>,
+        rpc: VoteRequest<C>,
+        tx: RaftRespTx<VoteResponse<C>, VoteError<C>>,
     },
     InstallSnapshot {
-        rpc: InstallSnapshotRequest,
-        tx: RaftRespTx<InstallSnapshotResponse, InstallSnapshotError>,
+        rpc: InstallSnapshotRequest<C>,
+        tx: RaftRespTx<InstallSnapshotResponse<C>, InstallSnapshotError<C>>,
     },
     ClientWriteRequest {
         rpc: ClientWriteRequest<C>,
-        tx: RaftRespTx<ClientWriteResponse<C>, ClientWriteError>,
+        tx: RaftRespTx<ClientWriteResponse<C>, ClientWriteError<C>>,
     },
     ClientReadRequest {
-        tx: RaftRespTx<(), ClientReadError>,
+        tx: RaftRespTx<(), ClientReadError<C>>,
     },
     Initialize {
-        members: EitherNodesOrIds,
-        tx: RaftRespTx<(), InitializeError>,
+        members: EitherNodesOrIds<C>,
+        tx: RaftRespTx<(), InitializeError<C>>,
     },
     // TODO(xp): make tx a field of a struct
     /// Request raft core to setup a new replication to a learner.
     AddLearner {
-        id: NodeId,
+        id: C::NodeId,
 
         node: Option<Node>,
 
@@ -486,10 +511,10 @@ pub(crate) enum RaftMsg<C: RaftTypeConfig> {
         blocking: bool,
 
         /// Send the log id when the replication becomes line-rate.
-        tx: RaftRespTx<AddLearnerResponse, AddLearnerError>,
+        tx: RaftRespTx<AddLearnerResponse<C>, AddLearnerError<C>>,
     },
     ChangeMembership {
-        members: BTreeSet<NodeId>,
+        members: BTreeSet<C::NodeId>,
         /// with blocking==false, respond to client a ChangeMembershipError::LearnerIsLagging error at once if a
         /// non-member is lagging.
         ///
@@ -500,7 +525,7 @@ pub(crate) enum RaftMsg<C: RaftTypeConfig> {
         /// will be turned into learners, otherwise will be removed.
         turn_to_learner: bool,
 
-        tx: RaftRespTx<ClientWriteResponse<C>, ClientWriteError>,
+        tx: RaftRespTx<ClientWriteResponse<C>, ClientWriteError<C>>,
     },
 }
 
@@ -548,9 +573,9 @@ where C: RaftTypeConfig
 /// An RPC sent by a cluster leader to replicate log entries (§5.3), and as a heartbeat (§5.2).
 #[derive(Serialize, Deserialize)]
 pub struct AppendEntriesRequest<C: RaftTypeConfig> {
-    pub vote: Vote,
+    pub vote: Vote<C>,
 
-    pub prev_log_id: Option<LogId>,
+    pub prev_log_id: Option<LogId<C>>,
 
     /// The new log entries to store.
     ///
@@ -560,7 +585,7 @@ pub struct AppendEntriesRequest<C: RaftTypeConfig> {
     pub entries: Vec<Entry<C>>,
 
     /// The leader's committed log id.
-    pub leader_commit: Option<LogId>,
+    pub leader_commit: Option<LogId<C>>,
 }
 
 impl<C: RaftTypeConfig> Clone for AppendEntriesRequest<C> {
@@ -601,13 +626,13 @@ impl<C: RaftTypeConfig> MessageSummary for AppendEntriesRequest<C> {
 
 /// The response to an `AppendEntriesRequest`.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AppendEntriesResponse {
-    pub vote: Vote,
+pub struct AppendEntriesResponse<C: RaftTypeConfig> {
+    pub vote: Vote<C>,
     pub success: bool,
     pub conflict: bool,
 }
 
-impl MessageSummary for AppendEntriesResponse {
+impl<C: RaftTypeConfig> MessageSummary for AppendEntriesResponse<C> {
     fn summary(&self) -> String {
         format!(
             "vote:{}, success:{:?}, conflict:{:?}",
@@ -619,7 +644,7 @@ impl MessageSummary for AppendEntriesResponse {
 /// A Raft log entry.
 #[derive(Serialize, Deserialize)]
 pub struct Entry<C: RaftTypeConfig> {
-    pub log_id: LogId,
+    pub log_id: LogId<C>,
 
     /// This entry's payload.
     #[serde(bound = "C::D: AppData")]
@@ -703,7 +728,7 @@ pub enum EntryPayload<C: RaftTypeConfig> {
     Normal(C::D),
 
     /// A change-membership log entry.
-    Membership(Membership),
+    Membership(Membership<C>),
 }
 
 impl<C: RaftTypeConfig> Clone for EntryPayload<C> {
@@ -742,44 +767,44 @@ impl<C: RaftTypeConfig> MessageSummary for EntryPayload<C> {
 
 /// An RPC sent by candidates to gather votes (§5.2).
 #[derive(Debug, Serialize, Deserialize)]
-pub struct VoteRequest {
-    pub vote: Vote,
-    pub last_log_id: Option<LogId>,
+pub struct VoteRequest<C: RaftTypeConfig> {
+    pub vote: Vote<C>,
+    pub last_log_id: Option<LogId<C>>,
 }
 
-impl MessageSummary for VoteRequest {
+impl<C: RaftTypeConfig> MessageSummary for VoteRequest<C> {
     fn summary(&self) -> String {
         format!("{}, last_log:{:?}", self.vote, self.last_log_id)
     }
 }
 
-impl VoteRequest {
-    pub fn new(vote: Vote, last_log_id: Option<LogId>) -> Self {
+impl<C: RaftTypeConfig> VoteRequest<C> {
+    pub fn new(vote: Vote<C>, last_log_id: Option<LogId<C>>) -> Self {
         Self { vote, last_log_id }
     }
 }
 
 /// The response to a `VoteRequest`.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct VoteResponse {
-    pub vote: Vote,
+pub struct VoteResponse<C: RaftTypeConfig> {
+    pub vote: Vote<C>,
 
     /// Will be true if the candidate received a vote from the responder.
     pub vote_granted: bool,
 
     /// The last log id stored on the remote voter.
-    pub last_log_id: Option<LogId>,
+    pub last_log_id: Option<LogId<C>>,
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// An RPC sent by the Raft leader to send chunks of a snapshot to a follower (§7).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InstallSnapshotRequest {
-    pub vote: Vote,
+pub struct InstallSnapshotRequest<C: RaftTypeConfig> {
+    pub vote: Vote<C>,
 
     /// Metadata of a snapshot: snapshot_id, last_log_ed membership etc.
-    pub meta: SnapshotMeta,
+    pub meta: SnapshotMeta<C>,
 
     /// The byte offset where this chunk of data is positioned in the snapshot file.
     pub offset: u64,
@@ -790,7 +815,7 @@ pub struct InstallSnapshotRequest {
     pub done: bool,
 }
 
-impl MessageSummary for InstallSnapshotRequest {
+impl<C: RaftTypeConfig> MessageSummary for InstallSnapshotRequest<C> {
     fn summary(&self) -> String {
         format!(
             "vote={}, meta={:?}, offset={}, len={}, done={}",
@@ -805,8 +830,8 @@ impl MessageSummary for InstallSnapshotRequest {
 
 /// The response to an `InstallSnapshotRequest`.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct InstallSnapshotResponse {
-    pub vote: Vote,
+pub struct InstallSnapshotResponse<C: RaftTypeConfig> {
+    pub vote: Vote<C>,
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -818,7 +843,6 @@ pub struct InstallSnapshotResponse {
 #[derive(Serialize, Deserialize)]
 pub struct ClientWriteRequest<C: RaftTypeConfig> {
     /// The application specific contents of this client request.
-    #[serde(bound = "C::D: AppData")]
     pub(crate) payload: EntryPayload<C>,
 }
 
@@ -845,14 +869,14 @@ impl<C: RaftTypeConfig> ClientWriteRequest<C> {
 /// The response to a `ClientRequest`.
 #[derive(Serialize, Deserialize)]
 pub struct ClientWriteResponse<C: RaftTypeConfig> {
-    pub log_id: LogId,
+    pub log_id: LogId<C>,
 
     /// Application specific response data.
     #[serde(bound = "C::R: AppDataResponse")]
     pub data: C::R,
 
     /// If the log entry is a change-membership entry.
-    pub membership: Option<Membership>,
+    pub membership: Option<Membership<C>>,
 }
 
 impl<C: RaftTypeConfig> Debug for ClientWriteResponse<C>

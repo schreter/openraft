@@ -76,9 +76,9 @@ pub struct ExampleSnapshot {
  */
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct ExampleStateMachine {
-    pub last_applied_log: Option<LogId>,
+    pub last_applied_log: Option<LogId<C>>,
 
-    pub last_membership: Option<EffectiveMembership>,
+    pub last_membership: Option<EffectiveMembership<C>>,
 
     /// Application data.
     pub data: BTreeMap<String, String>,
@@ -86,7 +86,7 @@ pub struct ExampleStateMachine {
 
 #[derive(Debug, Default)]
 pub struct ExampleStore {
-    last_purged_log_id: RwLock<Option<LogId>>,
+    last_purged_log_id: RwLock<Option<LogId<C>>>,
 
     /// The Raft log.
     log: RwLock<BTreeMap<u64, Entry<ExampleTypeConfig>>>,
@@ -104,7 +104,7 @@ pub struct ExampleStore {
 
 #[async_trait]
 impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
-    async fn get_log_state(&mut self) -> Result<LogState, StorageError> {
+    async fn get_log_state(&mut self) -> Result<LogState, StorageError<C>> {
         let log = self.log.read().await;
         let last = log.iter().rev().next().map(|(_, ent)| ent.log_id);
 
@@ -124,7 +124,7 @@ impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<Entry<ExampleTypeConfig>>, StorageError> {
+    ) -> Result<Vec<Entry<ExampleTypeConfig>>, StorageError<C>> {
         let log = self.log.read().await;
         let response = log.range(range.clone()).map(|(_, val)| val.clone()).collect::<Vec<_>>();
         Ok(response)
@@ -134,7 +134,7 @@ impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
 #[async_trait]
 impl RaftSnapshotBuilder<ExampleTypeConfig, Cursor<Vec<u8>>> for Arc<ExampleStore> {
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn build_snapshot(&mut self) -> Result<Snapshot<Cursor<Vec<u8>>>, StorageError> {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<Cursor<Vec<u8>>>, StorageError<C>> {
         let (data, last_applied_log);
 
         {
@@ -193,19 +193,19 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     type SnapshotBuilder = Self;
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError> {
+    async fn save_vote(&mut self, vote: &Vote) -> Result<(), StorageError<C>> {
         // TODO: What `h` stands for?
         let mut h = self.vote.write().await;
         *h = Some(*vote);
         Ok(())
     }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote>, StorageError> {
+    async fn read_vote(&mut self) -> Result<Option<Vote>, StorageError<C>> {
         Ok(*self.vote.read().await)
     }
 
     #[tracing::instrument(level = "trace", skip(self, entries))]
-    async fn append_to_log(&mut self, entries: &[&Entry<ExampleTypeConfig>]) -> Result<(), StorageError> {
+    async fn append_to_log(&mut self, entries: &[&Entry<ExampleTypeConfig>]) -> Result<(), StorageError<C>> {
         let mut log = self.log.write().await;
         for entry in entries {
             log.insert(entry.log_id.index, (*entry).clone());
@@ -214,7 +214,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn delete_conflict_logs_since(&mut self, log_id: LogId) -> Result<(), StorageError> {
+    async fn delete_conflict_logs_since(&mut self, log_id: LogId<C>) -> Result<(), StorageError<C>> {
         tracing::debug!("delete_log: [{:?}, +oo)", log_id);
 
         let mut log = self.log.write().await;
@@ -227,7 +227,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn purge_logs_upto(&mut self, log_id: LogId) -> Result<(), StorageError> {
+    async fn purge_logs_upto(&mut self, log_id: LogId<C>) -> Result<(), StorageError<C>> {
         tracing::debug!("delete_log: [{:?}, +oo)", log_id);
 
         {
@@ -248,7 +248,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         Ok(())
     }
 
-    async fn last_applied_state(&mut self) -> Result<(Option<LogId>, Option<EffectiveMembership>), StorageError> {
+    async fn last_applied_state(&mut self) -> Result<(Option<LogId<C>>, Option<EffectiveMembership<C>>), StorageError<C>> {
         let state_machine = self.state_machine.read().await;
         Ok((state_machine.last_applied_log, state_machine.last_membership.clone()))
     }
@@ -257,7 +257,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     async fn apply_to_state_machine(
         &mut self,
         entries: &[&Entry<ExampleTypeConfig>],
-    ) -> Result<Vec<ExampleResponse>, StorageError> {
+    ) -> Result<Vec<ExampleResponse>, StorageError<C>> {
         let mut res = Vec::with_capacity(entries.len());
 
         let mut sm = self.state_machine.write().await;
@@ -287,7 +287,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Self::SnapshotData>, StorageError> {
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Self::SnapshotData>, StorageError<C>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -296,7 +296,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         &mut self,
         meta: &SnapshotMeta,
         snapshot: Box<Self::SnapshotData>,
-    ) -> Result<StateMachineChanges, StorageError> {
+    ) -> Result<StateMachineChanges, StorageError<C>> {
         tracing::info!(
             { snapshot_size = snapshot.get_ref().len() },
             "decoding snapshot for installation"
@@ -331,7 +331,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<Self::SnapshotData>>, StorageError> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<Self::SnapshotData>>, StorageError<C>> {
         match &*self.current_snapshot.read().await {
             Some(snapshot) => {
                 let data = snapshot.data.clone();

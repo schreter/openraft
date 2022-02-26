@@ -6,7 +6,6 @@ use actix_web::web::Data;
 use actix_web::App;
 use actix_web::HttpServer;
 use openraft::Config;
-use openraft::NodeId;
 use openraft::Raft;
 use openraft::RaftTypeConfig;
 
@@ -33,7 +32,7 @@ impl RaftTypeConfig for ExampleTypeConfig {
 
 pub type ExampleRaft = Raft<ExampleTypeConfig, ExampleNetwork, Arc<ExampleStore>>;
 
-pub async fn start_example_raft_node(node_id: NodeId, http_addr: String) -> std::io::Result<()> {
+pub async fn start_example_raft_node(node_id: C::NodeId, http_addr: String) -> std::io::Result<()> {
     // Create a configuration for the raft instance.
     let config = Arc::new(Config::default().validate().unwrap());
 

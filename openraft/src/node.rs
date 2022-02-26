@@ -5,9 +5,6 @@ use std::fmt::Formatter;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// A Raft node's ID.
-pub type NodeId = u64;
-
 /// Additional node information.
 ///
 /// The most usage is to store the connecting address of a node.

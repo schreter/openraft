@@ -8,7 +8,6 @@ use crate::error::NodeIdNotInNodes;
 use crate::Membership;
 use crate::MessageSummary;
 use crate::Node;
-use crate::NodeId;
 
 #[test]
 fn test_membership_summary() -> anyhow::Result<()> {
@@ -310,7 +309,7 @@ fn test_membership_majority() -> anyhow::Result<()> {
 fn test_membership_greatest_majority_value() -> anyhow::Result<()> {
     {
         let m123 = Membership::new(vec![btreeset! {1,2,3}], None);
-        assert_eq!(None, m123.greatest_majority_value(&BTreeMap::<NodeId, u64>::new()));
+        assert_eq!(None, m123.greatest_majority_value(&BTreeMap::<C::NodeId, u64>::new()));
         assert_eq!(None, m123.greatest_majority_value(&btreemap! {0=>10}));
         assert_eq!(None, m123.greatest_majority_value(&btreemap! {0=>10,1=>10}));
         assert_eq!(Some(&10), m123.greatest_majority_value(&btreemap! {0=>10,1=>10,2=>20}));

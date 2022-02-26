@@ -12,7 +12,6 @@ use openraft::error::RPCError;
 use openraft::error::RemoteError;
 use openraft::raft::AddLearnerResponse;
 use openraft::raft::ClientWriteResponse;
-use openraft::NodeId;
 use openraft::RaftMetrics;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -29,14 +28,14 @@ pub struct ExampleClient {
     /// The leader node to send request to.
     ///
     /// All traffic should be sent to the leader in a cluster.
-    pub leader: Arc<Mutex<(NodeId, String)>>,
+    pub leader: Arc<Mutex<(C::NodeId, String)>>,
 
     pub inner: Client,
 }
 
 impl ExampleClient {
     /// Create a client with a leader node id and a node manager to get node address by node id.
-    pub fn new(leader_id: NodeId, leader_addr: String) -> Self {
+    pub fn new(leader_id: C::NodeId, leader_addr: String) -> Self {
         Self {
             leader: Arc::new(Mutex::new((leader_id, leader_addr))),
             inner: reqwest::Client::new(),
@@ -80,7 +79,7 @@ impl ExampleClient {
     /// Add a node as learner.
     ///
     /// The node to add has to exist, i.e., being added with `write(ExampleRequest::AddNode{})`
-    pub async fn add_learner(&self, req: (NodeId, String)) -> Result<AddLearnerResponse, RPCError<AddLearnerError>> {
+    pub async fn add_learner(&self, req: (C::NodeId, String)) -> Result<AddLearnerResponse, RPCError<AddLearnerError>> {
         self.send_rpc_to_leader("add-learner", Some(&req)).await
     }
 
@@ -90,7 +89,7 @@ impl ExampleClient {
     /// or an error [`LearnerNotFound`] will be returned.
     pub async fn change_membership(
         &self,
-        req: &BTreeSet<NodeId>,
+        req: &BTreeSet<C::NodeId>,
     ) -> Result<ClientWriteResponse<ExampleTypeConfig>, RPCError<ClientWriteError>> {
         self.send_rpc_to_leader("change-membership", Some(req)).await
     }
